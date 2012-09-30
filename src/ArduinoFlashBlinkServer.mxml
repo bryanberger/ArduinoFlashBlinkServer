@@ -1,0 +1,242 @@
+<?xml version="1.0" encoding="utf-8"?>
+<s:WindowedApplication xmlns:fx="http://ns.adobe.com/mxml/2009" 
+					   xmlns:s="library://ns.adobe.com/flex/spark" 
+					   xmlns:mx="library://ns.adobe.com/flex/mx"
+					   creationComplete="init()"
+					   remove="onClosing(event)"
+					   close="onClosing(event)"
+					   closing="onClosing(event)">
+	<fx:Declarations>
+		<!-- Place non-visual elements (e.g., services, value objects) here -->
+	</fx:Declarations>
+	
+	<fx:Script>
+		<![CDATA[
+			import com.zaalabs.multi.PolicyServer;
+			import com.zaalabs.multi.discover.DiscoverableServerSocket;
+			import com.zaalabs.utils.NetworkUtil;
+			
+			import net.eriksjodin.arduino.Arduino;
+			import net.eriksjodin.arduino.ArduinoWithServo;
+			import net.eriksjodin.arduino.events.ArduinoEvent;
+			
+			private static const APPLICATION_NAME:String = 'com.bryanberger.arduinoblink';
+
+			private var _policyServer:PolicyServer;
+			private var _server:DiscoverableServerSocket;
+			private var _device:ArduinoWithServo;
+			private var _ledOn:Boolean = false;
+			
+			[Bindable]
+			private var _airIP:String = "127.0.0.1";
+			private var _airPort:int = 9999;
+			
+			private static const ARDUINOIP:String = "127.0.0.1";
+			private static const ARDUINOPORT:int = 5331;
+			
+			private var _defaultPinConfig:Array = new Array(
+				null,		// Pin 0   null (is RX)
+				null,		// Pin 1   null (is TX)
+				'digitalIn',  // Pin 2   digitalIn or digitalOut 
+				'digitalIn',  // Pin 3   pwmOut or digitalIn or digitalOut 
+				'digitalIn',  // Pin 4   digitalIn or digitalOut  
+				'digitalIn',  // Pin 5   pwmOut or digitalIn or digitalOut 
+				'digitalIn',  // Pin 6   pwmOut or digitalIn or digitalOut 
+				'digitalIn',  // Pin 7   digitalIn or digitalOut  
+				'digitalIn',  // Pin 8   digitalIn or digitalOut  
+				'servo',  // Pin 9   pwmOut or digitalIn or digitalOut or servo 
+				'digitalIn',  // Pin 10  pwmOut or digitalIn or digitalOut or servo
+				'digitalIn',  // Pin 11  pwmOut or digitalIn or digitalOut 
+				'digitalOut',  // Pin 12  digitalIn or digitalOut 
+				'digitalOut', // Pin 13  digitalIn or digitalOut ( led connected )
+				'analogIn',   // Analog pin 0  analogIn
+				'analogIn',   // Analog pin 1  analogIn
+				'analogIn',   // Analog pin 2  analogIn
+				'analogIn',   // Analog pin 3  analogIn
+				'analogIn',   // Analog pin 4  analogIn
+				'analogIn'    // Analog pin 5  analogIn
+			);
+			
+			protected function init():void
+			{			
+				airSocketInit();
+				arduinoInit();
+			}
+			
+			private function airSocketInit():void
+			{
+				log("- Started AIR Socket Server: " + _airIP + ":" + _airPort);
+				
+				_airIP = NetworkUtil.getIpAddress(NetworkInfo.networkInfo.findInterfaces());   
+				
+				try
+				{
+					_server = new DiscoverableServerSocket(APPLICATION_NAME, _airIP);
+					//_server.bind(_airPort, _airIP);
+					_server.bind(_airPort, _airIP);
+					_policyServer = new PolicyServer(_server.localPort);
+				}
+				catch(e:Error)
+				{
+					log("- Error occured: "+e);
+					return;
+				}
+				_server.listen();
+				_server.addEventListener(ServerSocketConnectEvent.CONNECT, onConnect);
+				
+			}
+			
+			private function onConnect(event:ServerSocketConnectEvent):void
+			{
+				log("- Client Connected!");
+				var client:Socket = event.socket;
+				
+				client.addEventListener(ProgressEvent.SOCKET_DATA, onSocketData);
+				client.addEventListener(Event.CLOSE, onDisconnect);
+			}
+			
+			private function onDisconnect(event:Event):void
+			{
+				log("- Client Disconnected...");
+				var client:Socket = Socket(event.target);
+				client.removeEventListener(ProgressEvent.SOCKET_DATA, onSocketData);
+				client.removeEventListener(Event.CLOSE, onDisconnect);
+			}
+			
+			private function onSocketData(event:ProgressEvent):void
+			{
+				var client:Socket = Socket(event.target);
+				var obj:Object = client.readObject();
+				
+				if(obj.name == "blink")
+				{
+					doBlink( client );
+				}
+				
+				// you can listen for other object types if you want
+			}
+			
+			private function sendObjectResponse( client:Socket, name:String ):void
+			{				
+				if(_server && client)
+				{
+					var obj:Object = new Object();
+					obj.name = name;
+					
+					log('- Sent to Client: ' + obj.name);
+					
+					client.writeObject(obj);
+					client.flush();
+				}
+			}
+						
+			private function log(value:*):void
+			{
+				trace(value);
+				output.appendText(value.toString()+"\n");
+			}
+			
+			private function onClosing(event:Event):void
+			{
+				if(_server && _server.bound)
+					_server.close();
+			}
+			
+			
+			
+			
+			/*= ARDUINO CONTROL HERE
+			**********************************************************************/
+			private function arduinoInit():void
+			{
+				_device = new ArduinoWithServo("127.0.0.1", 5331);
+				_device.addEventListener(Event.CONNECT, onSocketConnect); 
+				_device.addEventListener(IOErrorEvent.IO_ERROR, errorHandler);
+				_device.addEventListener(ArduinoEvent.FIRMWARE_VERSION, onReceiveFirmwareVersion);
+			}
+			
+			private function errorHandler(errorEvent:IOErrorEvent):void 
+			{   
+				log("- " + errorEvent.text);
+				log("- Did you start the Serproxy program ?");
+			}
+			
+			private function onSocketConnect(e:Object):void 
+			{	
+				log("- Serproxy Connected! Waiting for Adruino...");
+				
+				// request the firmware version
+				_device.requestFirmwareVersion();	
+			}
+			
+			private function onReceiveFirmwareVersion(e:ArduinoEvent):void 
+			{   
+				log("- Connection with Arduino - Firmata version: " + String(e.value)); 		
+				log("- Set default pin configuration.");
+								
+				// set Pinmodes by the default array. 
+				for(var i:int = 2; i < _defaultPinConfig.length; i++)
+				{ // set digital output pins
+					if(_defaultPinConfig[i] == "digitalOut") _device.setPinMode(i, Arduino.OUTPUT);
+					// set digital input pins
+					if(_defaultPinConfig[i] == "digitalIn")  _device.setPinMode(i, Arduino.INPUT);
+					// set pwm output pins
+					if(_defaultPinConfig[i] ==  "pwmOut")    _device.setPinMode(i, Arduino.PWM);
+					// set servo output pins
+					if(_defaultPinConfig[i] ==  "servo")    
+					{ 
+						_device.setupServo(i, 90);
+						// write set start position to 0 otherwise it turns directly to 90 degrees.
+						_device.writeAnalogPin(i, 90);
+					}
+				}	
+				
+				// you have to turn on reporting for every ANALOG pin individualy. 
+				for(var j:int = 0; j<6; j++)
+				{ 
+					_device.setAnalogPinReporting(j, Arduino.ON);	
+				}
+				
+				
+				// for digital pins its only one setting
+				_device.enableDigitalPinReporting();	
+				
+				log("- Arduino Ready!");
+			}
+			
+			private function doBlink( socket:Socket ):void
+			{
+				var socket:Socket = Socket(socket);
+				
+				if(_device.connected)
+				{
+					if(_ledOn)
+					{
+						log('- Manual LED OFF.');
+						
+						sendObjectResponse(socket, 'LED OFF');
+						_ledOn = false;
+						_device.writeDigitalPin(13, 0);
+					}
+					else
+					{
+						log('- Manual LED ON.');
+						
+						sendObjectResponse(socket, 'LED ON');
+						_ledOn = true;
+						_device.writeDigitalPin(13, 1);
+					}
+				}
+			}
+			
+		
+			
+		]]>
+	</fx:Script>
+	
+	<s:VGroup width="100%" height="100%">
+		<s:Button id="btnReconnect" label="Reconnect" height="10%" click="{arduinoInit()}" />
+		<s:TextArea id="output" width="100%" height="90%" editable="false" />
+	</s:VGroup>
+	
+</s:WindowedApplication>
